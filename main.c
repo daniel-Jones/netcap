@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <netinet/udp.h>
 
 // helper macros
 // ---------------------
@@ -50,7 +51,11 @@ FILE *out_handle =   NULL;
 
 void usage(FILE *file, char *argv[]);
 void print_hex_ascii(FILE *file, const unsigned char *data, size_t size);
-void capture_tcp_packets(void);
+void capture_packets(void);
+void print_eth_header(const struct ethhdr *eth, uint16_t eth_type, bool vlan_present, uint16_t vlan_id);
+void print_ip_header(const struct iphdr *ip, size_t iphdrlen, uint8_t protocol);
+void print_tcp_header(const struct tcphdr *tcp);
+void print_udp_header(const struct udphdr *udp);
 
 void
 usage(FILE *file, char *argv[])
@@ -82,7 +87,62 @@ has_raw_socket_permission(void)
 }
 
 void
-capture_tcp_packets(void)
+print_eth_header(const struct ethhdr *eth, uint16_t eth_type, bool vlan_present, uint16_t vlan_id)
+{
+    VERBOSE_PRINTF("Ethernet Header:\n");
+    VERBOSE_PRINTF("  Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+        eth->h_source[0], eth->h_source[1], eth->h_source[2],
+        eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+    VERBOSE_PRINTF("  Dst MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+        eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+        eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+    VERBOSE_PRINTF("  EtherType: 0x%04x\n", eth_type);
+    if (vlan_present)
+    {
+        VERBOSE_PRINTF("  VLAN tag present: VLAN ID %u\n", vlan_id);
+    }
+}
+
+void
+print_ip_header(const struct iphdr *ip, size_t iphdrlen, uint8_t protocol)
+{
+    VERBOSE_PRINTF("IP Header:\n");
+    VERBOSE_PRINTF("  Src IP: %s\n", inet_ntoa(*(struct in_addr *)&ip->saddr));
+    VERBOSE_PRINTF("  Dst IP: %s\n", inet_ntoa(*(struct in_addr *)&ip->daddr));
+    if (protocol == IPPROTO_TCP)
+        VERBOSE_PRINTF("  Protocol: %u (TCP)\n", ip->protocol);
+    else if (protocol == IPPROTO_UDP)
+        VERBOSE_PRINTF("  Protocol: %u (UDP)\n", ip->protocol);
+    else
+        VERBOSE_PRINTF("  Protocol: %u\n", ip->protocol);
+    VERBOSE_PRINTF("  Header Length: %zu\n", iphdrlen);
+    VERBOSE_PRINTF("  Total Length: %u\n", ntohs(ip->tot_len));
+}
+
+void
+print_tcp_header(const struct tcphdr *tcp)
+{
+    VERBOSE_PRINTF("TCP Header:\n");
+    VERBOSE_PRINTF("  Src Port: %u\n", ntohs(tcp->source));
+    VERBOSE_PRINTF("  Dst Port: %u\n", ntohs(tcp->dest));
+    VERBOSE_PRINTF("  Seq: %u\n", ntohl(tcp->seq));
+    VERBOSE_PRINTF("  Ack: %u\n", ntohl(tcp->ack_seq));
+    VERBOSE_PRINTF("  Data Offset: %u\n", tcp->doff * 4);
+    VERBOSE_PRINTF("  Flags: 0x%02x\n", ((unsigned char *)tcp)[13]);
+}
+
+void
+print_udp_header(const struct udphdr *udp)
+{
+    VERBOSE_PRINTF("UDP Header:\n");
+    VERBOSE_PRINTF("  Src Port: %u\n", ntohs(udp->source));
+    VERBOSE_PRINTF("  Dst Port: %u\n", ntohs(udp->dest));
+    VERBOSE_PRINTF("  Length: %u\n", ntohs(udp->len));
+    VERBOSE_PRINTF("  Checksum: 0x%04x\n", ntohs(udp->check));
+}
+
+void
+capture_packets(void)
 {
     int sockfd;
     char frame[65536];
@@ -120,7 +180,7 @@ capture_tcp_packets(void)
         }
     }
 
-    VERBOSE_PRINTF("Capturing TCP packets on interface: %s, port: %d\n", interface ? interface : "all", port);
+    VERBOSE_PRINTF("Capturing TCP/UDP packets on interface: %s, port: %d\n", interface ? interface : "all", port);
 
     while (num_packets == 0 || packet_count < num_packets)
     {
@@ -156,62 +216,64 @@ capture_tcp_packets(void)
             continue; // not an IP packet
         // layer 3 headers
         struct iphdr *ip = (struct iphdr *)(frame + l2_offset);
-        if (ip->protocol != IPPROTO_TCP)
-            continue; // not a TCP packet
-        /*
-        TCP packet structure:
-        | Ethernet Header | [VLAN Tag] | IP Header (20-60 bytes) | TCP Header | Payload |
-        ^ frame           ^ l2_offset  ^ iphdr                   ^ tcp        ^ payload
-                          ^ we possibly skip the vlan tag if it is present
-        */
         size_t iphdrlen = ip->ihl * 4; // ihl is the internet header length in 32-bit words, *4 to get bytes
-        struct tcphdr *tcp = (struct tcphdr *)(frame + l2_offset + iphdrlen);
-        /*
-            filter by port if specificed
-            if neither source or destination port match our specific port, we just skip the packet
-            (make sure we are either an incoming or outgoing packet)
-        */
-        if (port > 0 && ntohs(tcp->source) != port && ntohs(tcp->dest) != port)
-            continue;
-        /*
-            payload is the data after the tcp header
-            tcp header tcp->doff is 32 bit words, *4 to get bytes
 
-            ip header address + ip header length + tcp header length
-        */
-        size_t tcp_offset = l2_offset + iphdrlen + tcp->doff * 4;
-        size_t payload_len = ntohs(ip->tot_len) - iphdrlen - tcp->doff * 4;
-        const unsigned char *payload = (const unsigned char *)(frame + tcp_offset); // we may want to print only the payload at some point?
+        if (ip->protocol == IPPROTO_TCP)
+        {
+            struct tcphdr *tcp = (struct tcphdr *)(frame + l2_offset + iphdrlen);
+            /*
+                filter by port if specificed
+                if neither source or destination port match our specific port, we just skip the packet
+                (make sure we are either an incoming or outgoing packet)
+            */
+            if (port > 0 && ntohs(tcp->source) != port && ntohs(tcp->dest) != port)
+                continue;
+            /*
+                payload is the data after the tcp header
+                tcp header tcp->doff is 32 bit words, *4 to get bytes
 
-        VERBOSE_PRINTF("\n=== Packet %zu ===\n", packet_count + 1);
-        VERBOSE_PRINTF("Ethernet Header:\n");
-        VERBOSE_PRINTF("  Src MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-            eth->h_source[0], eth->h_source[1], eth->h_source[2],
-            eth->h_source[3], eth->h_source[4], eth->h_source[5]);
-        VERBOSE_PRINTF("  Dst MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-            eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
-            eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-        VERBOSE_PRINTF("  EtherType: 0x%04x\n", eth_type);
-        if (vlan_present) {
-            VERBOSE_PRINTF("  VLAN tag present: VLAN ID %u\n", vlan_id);
+                ip header address + ip header length + tcp header length
+            */
+            size_t tcp_offset = l2_offset + iphdrlen + tcp->doff * 4;
+            size_t payload_len = ntohs(ip->tot_len) - iphdrlen - tcp->doff * 4;
+            const unsigned char *payload = (const unsigned char *)(frame + tcp_offset); // we may want to print only the payload at some point?
+
+            VERBOSE_PRINTF("\n=== Packet %zu ===\n", packet_count + 1);
+            print_eth_header(eth, eth_type, vlan_present, vlan_id);
+            print_ip_header(ip, iphdrlen, ip->protocol);
+            print_tcp_header(tcp);
+            VERBOSE_PRINTF("\nFull Packet Hexdump:\n");
+            PRINT_HEX_ASCII((const unsigned char *)frame, frame_size);
+            VERBOSE_PRINTF("---\n");
+            packet_count++;
         }
-        VERBOSE_PRINTF("IP Header:\n");
-        VERBOSE_PRINTF("  Src IP: %s\n", inet_ntoa(*(struct in_addr *)&ip->saddr));
-        VERBOSE_PRINTF("  Dst IP: %s\n", inet_ntoa(*(struct in_addr *)&ip->daddr));
-        VERBOSE_PRINTF("  Protocol: %u\n", ip->protocol);
-        VERBOSE_PRINTF("  Header Length: %zu\n", iphdrlen);
-        VERBOSE_PRINTF("  Total Length: %u\n", ntohs(ip->tot_len));
-        VERBOSE_PRINTF("TCP Header:\n");
-        VERBOSE_PRINTF("  Src Port: %u\n", ntohs(tcp->source));
-        VERBOSE_PRINTF("  Dst Port: %u\n", ntohs(tcp->dest));
-        VERBOSE_PRINTF("  Seq: %u\n", ntohl(tcp->seq));
-        VERBOSE_PRINTF("  Ack: %u\n", ntohl(tcp->ack_seq));
-        VERBOSE_PRINTF("  Data Offset: %u\n", tcp->doff * 4);
-        VERBOSE_PRINTF("  Flags: 0x%02x\n", ((unsigned char *)tcp)[13]);
-        VERBOSE_PRINTF("\nFull Packet Hexdump:\n");
-        PRINT_HEX_ASCII((const unsigned char *)frame, frame_size);
-        VERBOSE_PRINTF("---\n");
-        packet_count++;
+        else if (ip->protocol == IPPROTO_UDP)
+        {
+            struct udphdr *udp = (struct udphdr *)(frame + l2_offset + iphdrlen);
+            /*
+                filter by port if specificed
+                if neither source or destination port match our specific port, we just skip the packet
+                (make sure we are either an incoming or outgoing packet)
+            */
+            if (port > 0 && ntohs(udp->source) != port && ntohs(udp->dest) != port)
+                continue;
+            /*
+                payload is the data after the udp header
+                udp header is always 8 bytes
+            */
+            size_t udp_offset = l2_offset + iphdrlen + sizeof(struct udphdr);
+            size_t payload_len = ntohs(udp->len) - sizeof(struct udphdr);
+            const unsigned char *payload = (const unsigned char *)(frame + udp_offset);
+
+            VERBOSE_PRINTF("\n=== Packet %zu ===\n", packet_count + 1);
+            print_eth_header(eth, eth_type, vlan_present, vlan_id);
+            print_ip_header(ip, iphdrlen, ip->protocol);
+            print_udp_header(udp);
+            VERBOSE_PRINTF("\nFull Packet Hexdump:\n");
+            PRINT_HEX_ASCII((const unsigned char *)frame, frame_size);
+            VERBOSE_PRINTF("---\n");
+            packet_count++;
+        }
     }
     close(sockfd);
 }
@@ -294,7 +356,7 @@ main(int argc, char *argv[])
             perror("Cannot open output file"); 
     }
 
-    capture_tcp_packets(); // capture packets
+    capture_packets(); // capture packets
 
     if (out_handle)
         fclose(out_handle);
